@@ -1,8 +1,8 @@
 ---
 name: autonomous-prototype-build
-description: 'Use when the user has a binary acceptance contract and wants the agent to keep working — measure, decide, execute, verify — until the contract passes, a hard architectural blocker forces a decision only they can make, or the wall-clock + token budget runs out. The skill writes status to a file the user can tail anytime; it does NOT ask for mid-loop confirmations. Triggers — EN: "autonomous build", "headless engineer", "ship until it works", "until it''s done", "no breaks until working", "non-stop until done". DE: "fertig bis es geht", "ohne Unterbrechung", "headless modus".'
+description: 'Use when the user has a binary acceptance contract and wants the agent to keep working — measure, decide, execute, verify — until the contract passes, a hard architectural blocker forces a decision only they can make, or the wall-clock + token budget runs out. Suited for prototype/POC delivery work that grinds: a failing test suite to drive green, a flaky integration to chase down, a small endpoint to ship. The skill writes status to a file the user can tail anytime; it does NOT ask for mid-loop confirmations. Triggers — EN: "run until green", "agentic build until done", "fire and forget", "ship until it works", "no breaks until working", "non-stop until done", "build the prototype until it works". DE: "lauf alleine durch", "ohne Pause durchziehen", "bau das durch", "ohne Rückfrage", "headless durchlaufen lassen", "prototyp ohne Unterbrechung". Do NOT use for: taste-based goals ("make this nicer"), exploratory questions, single-test debugging that takes under 10 minutes total, or anything involving irreversible production actions (deploys, destructive DB ops, sending client email).'
 license: MIT
-version: 0.2.0
+version: 0.2.1
 maintainer: michael@kupermann.com
 ---
 
@@ -79,7 +79,7 @@ Every move is decided against these rules. There is no persona; the rules are th
 1. **Evidence before assertions.** No claim of progress without a measurement. "The fix probably works" is not a claim; an exit code is.
 2. **You don't understand the problem if you can't articulate the test.** Refuse to act on hypotheses that aren't immediately testable.
 3. **Tight feedback loops over heroic batches.** Five 5-minute experiments beat one 90-minute speculative rewrite.
-4. **Empirical humility.** When two iterations don't move the metric, the hypothesis is wrong, not the implementation. Try differently, not harder.
+4. **Hypothesis-first.** When two iterations don't move the metric, the hypothesis is wrong, not the implementation. Try differently, not harder.
 5. **Simpler interventions first.** Config tuning before code changes. Code changes before architecture. Architecture before greenfield.
 6. **Cumulative learning.** Every iteration's findings get logged as "we now know X / we ruled out Y". Don't re-run experiments whose result is in the log.
 7. **Safety is non-negotiable.** Never `--no-verify`, `--force`, or skip a quality gate. Push back on contracts that lure you toward those.
@@ -92,29 +92,44 @@ The full rules, the step-back expert-lens panel, and the voice/anti-voice guidan
 Before entering the loop:
 
 ```bash
+# Concurrency lock — one autonomous build per repo at a time.
+LOCK=.claude/autonomous-build.lock
+if [ -e "$LOCK" ] && kill -0 "$(awk '{print $1}' "$LOCK")" 2>/dev/null; then
+    echo "Another autonomous build is running (PID $(awk '{print $1}' "$LOCK") since $(awk '{print $2}' "$LOCK"))"; exit 1
+fi
+echo "$$ $(date -u +%FT%TZ)" > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
 # Workspace sanity
 git status --porcelain                  # MUST be empty (or user explicitly acks dirty baseline)
 BASELINE_SHA=$(git rev-parse HEAD)
 
 # Determinism check on the verifying command
-for i in 1 2 3; do <verifying_command> || FLAKE=1; done
+# 10-run minimum is the industry default for catching flakes (≈80% catch rate).
+# 3 runs catches roughly 20% of real flakes — too few. Raise the count if your
+# stack is known-flaky; lower only with explicit user opt-in.
+FLAKE=0
+for i in $(seq 1 10); do <verifying_command> || FLAKE=1; done
 # If FLAKE: refuse to start. A non-deterministic verifier means we can't tell progress from noise.
 
-# Baseline counts
-BASELINE_TEST_COUNT=$(<test_collect_command> | wc -l)
+# Baseline test count — robust parse, not line-count of the whole output.
+# pytest --collect-only -q ends with a summary line like "5 tests collected".
+BASELINE_TEST_COUNT=$(<test_collect_command> | tail -1 | grep -oE '^[0-9]+')
 
 # Resource guards
 df -h .                                  # disk free?
 lsof -iTCP:<dev_server_port> || true     # any port we'll need already taken?
 ```
 
-If any check fails, the agent writes the failure into the status file and asks the user to fix the precondition. Do not start the loop on a dirty workspace or a flaky verifier.
+If any check fails, the agent writes the failure into the status file and asks the user to fix the precondition. Do not start the loop on a dirty workspace, a flaky verifier, or while another autonomous build holds the lock.
 
 ## The loop
 
 ```
 session_start = now()
 record session_start, all inputs, baseline measurements in status file
+last_delta_sign = 0
+delta_window   = []                         # last 5 deltas for oscillation detection
 
 while True:
     # 1. STATUS CHECK
@@ -124,8 +139,8 @@ while True:
 
     # 2. STOP CHECKS (priority order)
     if gap_structural.passes() and gap_userpath.passes():
-        run_independent_verifier()          # one re-run; must agree
-        if agrees: write_success_report(); break
+        if run_independent_verifier(): write_success_report(); break
+        # else: a one-shot green is not enough; keep looping.
     if wall_clock_exceeded(): write_timeout_report(); break
     if tokens_exceeded(): write_token_timeout_report(); break
     if hard_blocker_triggered(): write_escalation_report(); break
@@ -133,35 +148,74 @@ while True:
         git_reset_hard("HEAD~1")            # well-defined because we commit per iteration
         if still_broken(): write_rollback_report(); break
 
-    # 3. PICK NEXT MOVE
-    # exactly one concrete action — edit a file, run a test, dispatch a sub-agent
-    move = highest_leverage_action(snapshot, gap, history)
+    # 3. PICK NEXT MOVE — heuristic, not vibes
+    # Tied to last_delta_sign and Decision Rule 5 (config → code → arch → greenfield):
+    #   last_delta > 0  → continue on same axis (same module, smaller variation)
+    #   last_delta < 0  → revert was already done above; pick an ORTHOGONAL attack
+    #   last_delta == 0 → escalate the cost class one step (config exhausted → code; etc.)
+    # Among feasible moves, pick the lowest-cost class not ruled out by history.
+    move = pick_move(snapshot, gap, history, last_delta_sign)
+    # Exactly one concrete action — edit a file, run a test, dispatch a sub-agent.
 
     # 4. EXECUTE
+    # Sub-agent dispatches MUST summarise prior transcripts to ≤2 KB before re-dispatch.
+    if move.is_subagent_dispatch and history.has_prior_transcript_for(move.target):
+        move.context = summarise(history.transcript_for(move.target), max_kb=2)
     result = perform(move)
+    # Second token check — a single fan-out can blow the budget mid-iteration,
+    # before the next while-top is reached.
+    if tokens_exceeded(): write_token_timeout_report(); break
 
     # 5. CLEANUP (mandatory before verify)
-    kill_orphan_subagent_processes()        # pgrep -P $$ then kill stale children
-    free_claimed_ports_if_any()
+    kill_orphan_subagent_processes()        # pgrep -P $$, then SIGTERM stale children
+    free_claimed_ports_if_any()             # lsof -iTCP:<port>, kill if held by stale child
 
     # 6. VERIFY (mandatory — no skipping)
     new_snapshot = read_state()
-    delta = quantify_change(snapshot, new_snapshot)
+    delta_structural = quantify_change(snapshot.structural, new_snapshot.structural)
+    delta_userpath   = quantify_change(snapshot.userpath,   new_snapshot.userpath)
+    # Composition: weakest gate sets progress; ANY negative gate triggers revert.
+    if delta_structural < 0 or delta_userpath < 0:
+        delta = min(delta_structural, delta_userpath)
+        regression = True
+    else:
+        delta = min(delta_structural, delta_userpath)   # zero if either is flat
+        regression = False
 
     # 7. COMMIT (so rollback is well-defined)
-    if delta is positive: git commit -am "iter-N: <move summary>"
-    if delta is negative: git reset --hard HEAD; mark regression
-    if delta is zero: stuck_streak += 1; do not commit
+    if regression:           git reset --hard HEAD; mark_regression()
+    elif delta > 0:          git commit -am "iter-N: <move summary>"
+    else:                    pass                  # no commit on zero-delta
+
+    last_delta_sign = sign(delta)
+    delta_window.append(delta); delta_window = delta_window[-5:]
 
     # 8. LOG
     overwrite_current_state_block(snapshot, gap, next_action)
     append_iteration_entry(iteration_number, elapsed, tokens_used, move, delta)
 
-    # 9. STEP BACK
-    if stuck_streak >= 3: trigger step-back analysis (force a different attack vector)
+    # 9. STEP BACK — smoothed, catches oscillation as well as flatline
+    zero_streak = count_trailing(delta_window, lambda d: d == 0)
+    net_window  = sum(delta_window)
+    oscillating = (len(delta_window) == 5
+                   and abs(net_window) <= NOISE_THRESHOLD
+                   and any(d > 0 for d in delta_window)
+                   and any(d < 0 for d in delta_window))
+    if zero_streak >= 3 or oscillating:
+        trigger_step_back()                  # force a different attack vector
+        delta_window = []                    # reset so we don't re-fire next iter
 ```
 
-The full pseudocode with notes on each step lives in `references/loop-pseudocode.md`.
+**Definitions (the named functions above):**
+
+- `run_independent_verifier()` — re-run the verifying command in a **fresh subprocess** with cleared transient state: `bash -c "$verifying_command"` (not the parent shell), `__pycache__` swept, `node_modules/.cache` cleared, `.pytest_cache/` removed. Returns true only if the fresh run agrees with the in-process run. Catches test pollution that a same-shell re-run misses.
+- `kill_orphan_subagent_processes()` — `pgrep -P $$` to enumerate children, `kill -TERM` then `kill -KILL` after 2s grace. Skip the loop's own PID.
+- `summarise(transcript, max_kb)` — extract a structured summary: facts learned, hypotheses ruled out, last error message verbatim. Drop tool-call dumps, intermediate reasoning, and successful-but-irrelevant sub-results. Truncating raw transcripts to N KB without summarising loses the load-bearing facts.
+- `pick_move()` — see the heuristic above. The full move-selection panel and Decision Rule 5 mapping live in `references/decision-discipline.md`.
+
+The full pseudocode with notes per step lives in `references/loop-pseudocode.md`.
+
+**On the step-back threshold.** The `if zero_streak >= 3 or oscillating` test is the same threshold as the Self-review gate below ("3 consecutive iterations without a measurable change"). One concept, one number. The Self-review gate is the *human-readable* statement; the loop pseudocode is the *operational* implementation.
 
 ## Self-review gates (the discipline that prevents drift)
 

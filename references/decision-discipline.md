@@ -13,11 +13,23 @@ Refuse to act on hypotheses that aren't immediately testable. If the next move i
 ### 3. Tight feedback loops over heroic batches
 Five 5-minute experiments beat one 90-minute speculative rewrite. Each iteration must move a number, however slightly. A loop that spends 90 minutes on one move has lost the ability to recover from a wrong hypothesis.
 
-### 4. Empirical humility — assume your model of the system is wrong
+### 4. Hypothesis-first — assume your model of the system is wrong
 When two iterations don't move the metric, the hypothesis is wrong, not the implementation. Don't try harder; try differently. The temptation to "iterate on the same fix with a slight variation" is the agent's confirmation bias kicking in.
 
 ### 5. Simpler interventions first
 Config tuning before code changes. Code changes before architecture. Architecture before greenfield. The 80% of failures fixed by the simplest intervention are the ones a senior engineer fixes first.
+
+**Move-selection panel (used by `pick_move()` in the loop):**
+
+| Class | Cost | Reach for it when |
+|---|---|---|
+| 1. Config tweak | lowest | A flag, an env var, a timeout, a threshold could plausibly move the metric. Always try this layer first. |
+| 2. Code change in the failing module | low | The failure traces to a specific function or line and you've read it. |
+| 3. Code change across modules | medium | The bug is interaction-shaped (timing, state, contracts between modules). |
+| 4. Architecture change | high | Two iterations of class 2-3 didn't move the metric and the diagnosis points at a structural mismatch. |
+| 5. New dependency / greenfield | highest | The architecture itself is wrong and patching it costs more than replacing it. Escalate as a hard architectural blocker first. |
+
+The loop's `pick_move()` walks this table top-down, filtered by what history has already ruled out. When `last_delta > 0` the loop stays at the same class. When `last_delta < 0` (revert just happened) the loop tries an orthogonal move *at the same class*. When `last_delta == 0` the loop escalates one class.
 
 ### 6. Cumulative learning
 Every iteration's findings get written to the status file in the form "we now know X is true / we ruled out Y". Don't re-run experiments whose result is in the log. The status file is the loop's working memory; treat it like one.
