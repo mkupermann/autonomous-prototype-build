@@ -5,8 +5,12 @@ The full version of the loop summarised in `SKILL.md`. Each step has notes on wh
 ```python
 session_start = now()
 record(session_start, all_inputs, baseline_measurements)
-last_delta_sign = 0
-delta_window   = []                          # rolling 5-iter window for oscillation detection
+last_delta_sign   = 0
+delta_window      = []                       # rolling 5-iter window: oscillation + decline
+exhausted_classes = set()                    # cost classes step-back has marked done
+NOISE_THRESHOLD   = user_input.noise_threshold or 0
+                                             # optional input: nonzero only for jittery
+                                             # metrics (latency, coverage %). Default = 0.
 
 while True:
 
@@ -51,13 +55,15 @@ while True:
             break
 
     # ----- 3. PICK NEXT MOVE — heuristic, not vibes -----
-    # Decision Rule 5 ordering (config → code → architecture → greenfield),
-    # coupled to last_delta_sign:
+    # Decision Rule 5 ordering (config → code → architecture → greenfield).
+    # All moves stay in the SAME cost class until step-back marks it exhausted:
     #   last_delta > 0  → stay on same class, same module
-    #   last_delta < 0  → revert was already done; pick orthogonal attack at same class
-    #   last_delta == 0 → escalate one class (config exhausted → code; etc.)
-    # See references/decision-discipline.md for the full move-selection panel.
-    move = pick_move(snapshot, gap, history, last_delta_sign)
+    #   last_delta < 0  → revert already done; orthogonal attack at SAME class
+    #   last_delta == 0 → ROTATE within the same class (different lever)
+    # Inline class-escalation on a single zero-delta would burn Rule 5
+    # ("simpler interventions first") by iteration 3. Class jumps only
+    # when step-back below populates exhausted_classes.
+    move = pick_move(snapshot, gap, history, last_delta_sign, exhausted_classes)
     # ONE concrete action — edit a file, run a test, dispatch a sub-agent.
 
     # ----- 4. EXECUTE -----
@@ -92,17 +98,22 @@ while True:
         delta = min(delta_structural, delta_userpath)
         regression = False
 
-    # ----- 7. COMMIT -----
+    # ----- 7. COMMIT — every non-regression iteration -----
     if regression:
         run("git reset --hard HEAD")
         mark_regression()
     elif delta > 0:
         run(f"git commit -am 'iter-{N}: {move_summary}'")
     else:
-        pass                                 # no commit on zero-delta
+        # Zero-delta still commits, with a marker. Without this, the next
+        # positive iteration's commit silently bundles the zero-delta files
+        # alongside the actual progress. A later `git reset --hard HEAD~1`
+        # would then unwind two iterations at once and the status-file
+        # postmortem would not match the git history.
+        run(f"git commit -a --allow-empty -m 'iter-{N}: zero-delta — {move_summary}'")
     # Per-iteration commits are what make `git reset --hard HEAD~1`
-    # well-defined. Without this, "rollback the last change" means
-    # reverse-engineering the last 14 file edits.
+    # well-defined. Status file iteration N corresponds 1:1 with git
+    # commit iter-N — that's the audit-trail invariant.
 
     last_delta_sign = sign(delta)
     delta_window.append(delta); delta_window = delta_window[-5:]
@@ -111,16 +122,24 @@ while True:
     overwrite_current_state_block(snapshot, gap, next_action)
     append_iteration_entry(N, elapsed, tokens_used, move, delta)
 
-    # ----- 9. STEP BACK — smoothed, catches oscillation as well as flatline -----
-    zero_streak = count_trailing(delta_window, lambda d: d == 0)
-    net_window  = sum(delta_window)
-    oscillating = (len(delta_window) == 5
-                   and abs(net_window) <= NOISE_THRESHOLD
-                   and any(d > 0 for d in delta_window)
-                   and any(d < 0 for d in delta_window))
-    if zero_streak >= 3 or oscillating:
+    # ----- 9. STEP BACK — three failure modes, one trigger -----
+    zero_streak  = count_trailing(delta_window, lambda d: d == 0)
+    net_window   = sum(delta_window)
+    oscillating  = (len(delta_window) == 5
+                    and abs(net_window) <= NOISE_THRESHOLD
+                    and any(d > 0 for d in delta_window)
+                    and any(d < 0 for d in delta_window))
+    slow_bleed   = (len(delta_window) >= 3
+                    and all(d < 0 for d in delta_window[-3:]))
+                    # -1, -1, -1 has no zeros, no positives, but real harm
+                    # is happening. Without this branch the loop bleeds past
+                    # step-back and only catastrophic_regression catches it
+                    # — by which point the workspace is much further from
+                    # the last green state.
+    if zero_streak >= 3 or oscillating or slow_bleed:
         consult_expert_lens_panel()          # see references/decision-discipline.md
-        new_attack = pick_different_vector()
+        exhausted_classes.add(current_cost_class)   # NOW pick_move escalates
+        new_attack = pick_different_vector(exhausted_classes)
         if not new_attack:
             escalate_as_hard_blocker()
             break
@@ -173,16 +192,21 @@ Drop: tool-call dumps, intermediate reasoning, successful-but-irrelevant sub-res
 
 ### `pick_move()`
 
-Walks the move-selection panel (see `references/decision-discipline.md`) top-down, filtered by what history has already ruled out:
+Walks the move-selection panel (see `references/decision-discipline.md`) top-down, skipping any class in `exhausted_classes`:
 
 ```python
-def pick_move(snapshot, gap, history, last_delta_sign):
+def pick_move(snapshot, gap, history, last_delta_sign, exhausted_classes):
+    current_class = lowest_unexhausted_class(exhausted_classes)
     if last_delta_sign > 0:
-        return same_class_same_module(snapshot, history)
+        return same_class_same_module(snapshot, history, current_class)
     elif last_delta_sign < 0:
-        return same_class_orthogonal(snapshot, history)
+        return same_class_orthogonal(snapshot, history, current_class)
     else:
-        return escalate_one_class(snapshot, history)
+        # Rotate within the same class; do NOT escalate inline.
+        # Escalation is step-back's job (mark_class_exhausted),
+        # not pick_move's. This preserves Decision Rule 5 ordering
+        # across a normal 3-iter wobble.
+        return same_class_different_lever(snapshot, history, current_class)
 ```
 
 ## Notes per step
@@ -212,4 +236,4 @@ Per-iteration commits are what make `git reset --hard HEAD~1` a well-defined rol
 Two writes per iteration: overwrite the rolling block, append the immutable history entry. Both go to the same file.
 
 ### 9. Step back
-Two triggers: trailing 3 zero-deltas (flatline), or a 5-iter window that nets near zero with at least one positive and one negative (oscillation). The second catches the case where +1/-1/+1/-1/+1 keeps the zero-streak at zero while the loop produces nothing. The expert lens panel in `decision-discipline.md` forces structured reflection rather than "let me try one more thing."
+Three triggers: trailing 3 zero-deltas (flatline), 5-iter window netting near zero with both signs present (oscillation), and 3 trailing negative deltas (slow-bleed). The oscillation branch catches `+1/-1/+1/-1/+1` keeping `zero_streak` at zero while the loop produces nothing. The slow-bleed branch catches `-1/-1/-1/-1` — no zeros, no positives, but real harm. Without this branch the only catch is `catastrophic_regression`, which fires later and from a worse state. The expert lens panel in `decision-discipline.md` forces structured reflection rather than "let me try one more thing." `mark_class_exhausted()` is what actually escalates the cost class — until step-back fires, `pick_move()` rotates within the current class.

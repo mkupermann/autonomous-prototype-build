@@ -29,7 +29,15 @@ Config tuning before code changes. Code changes before architecture. Architectur
 | 4. Architecture change | high | Two iterations of class 2-3 didn't move the metric and the diagnosis points at a structural mismatch. |
 | 5. New dependency / greenfield | highest | The architecture itself is wrong and patching it costs more than replacing it. Escalate as a hard architectural blocker first. |
 
-The loop's `pick_move()` walks this table top-down, filtered by what history has already ruled out. When `last_delta > 0` the loop stays at the same class. When `last_delta < 0` (revert just happened) the loop tries an orthogonal move *at the same class*. When `last_delta == 0` the loop escalates one class.
+The loop's `pick_move()` walks this table top-down, filtered by `exhausted_classes` (which step-back populates). Within a class, the rule is:
+
+| last delta | Move |
+|---|---|
+| `> 0` | Stay on the same axis: same module, smaller variation. The hypothesis is working — keep pulling on the thread. |
+| `< 0` | Revert already happened in step 7. Pick an **orthogonal** attack within the same class (different lever, different module of the same kind). |
+| `== 0` | **Rotate within the same class.** Try a different config knob if the class is config; a different module if the class is code. Do NOT escalate one class on a single zero-delta — that breaks Rule 5 by Class N+1 by iteration 3. |
+
+Class escalation happens ONLY when step-back fires (`zero_streak >= 3` or oscillating or slow-bleed) and `mark_class_exhausted()` adds the current class to `exhausted_classes`. From then on `pick_move()` skips that class.
 
 ### 6. Cumulative learning
 Every iteration's findings get written to the status file in the form "we now know X is true / we ruled out Y". Don't re-run experiments whose result is in the log. The status file is the loop's working memory; treat it like one.

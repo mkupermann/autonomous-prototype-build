@@ -2,7 +2,7 @@
 name: autonomous-prototype-build
 description: 'Use when the user has a binary acceptance contract and wants the agent to keep working — measure, decide, execute, verify — until the contract passes, a hard architectural blocker forces a decision only they can make, or the wall-clock + token budget runs out. Suited for prototype/POC delivery work that grinds: a failing test suite to drive green, a flaky integration to chase down, a small endpoint to ship. The skill writes status to a file the user can tail anytime; it does NOT ask for mid-loop confirmations. Triggers — EN: "run until green", "agentic build until done", "fire and forget", "ship until it works", "no breaks until working", "non-stop until done", "build the prototype until it works". DE: "lauf alleine durch", "ohne Pause durchziehen", "bau das durch", "ohne Rückfrage", "headless durchlaufen lassen", "prototyp ohne Unterbrechung". Do NOT use for: taste-based goals ("make this nicer"), exploratory questions, single-test debugging that takes under 10 minutes total, or anything involving irreversible production actions (deploys, destructive DB ops, sending client email).'
 license: MIT
-version: 0.2.1
+version: 0.2.2
 maintainer: michael@kupermann.com
 ---
 
@@ -128,8 +128,12 @@ If any check fails, the agent writes the failure into the status file and asks t
 ```
 session_start = now()
 record session_start, all inputs, baseline measurements in status file
-last_delta_sign = 0
-delta_window   = []                         # last 5 deltas for oscillation detection
+last_delta_sign   = 0
+delta_window      = []                      # last 5 deltas for oscillation/decline detection
+exhausted_classes = set()                   # cost classes step-back has marked done
+NOISE_THRESHOLD   = user_input.noise_threshold or 0
+                                            # optional input: nonzero only for jittery
+                                            # metrics (latency, coverage %). Default = 0.
 
 while True:
     # 1. STATUS CHECK
@@ -149,12 +153,16 @@ while True:
         if still_broken(): write_rollback_report(); break
 
     # 3. PICK NEXT MOVE — heuristic, not vibes
-    # Tied to last_delta_sign and Decision Rule 5 (config → code → arch → greenfield):
+    # Decision Rule 5 ordering (config → code → arch → greenfield).
+    # All moves stay in the SAME cost class until step-back marks it exhausted:
     #   last_delta > 0  → continue on same axis (same module, smaller variation)
-    #   last_delta < 0  → revert was already done above; pick an ORTHOGONAL attack
-    #   last_delta == 0 → escalate the cost class one step (config exhausted → code; etc.)
-    # Among feasible moves, pick the lowest-cost class not ruled out by history.
-    move = pick_move(snapshot, gap, history, last_delta_sign)
+    #   last_delta < 0  → revert was already done above; pick orthogonal attack at SAME class
+    #   last_delta == 0 → ROTATE within same class (different lever, different module
+    #                     of the same kind). Do NOT escalate inline — that is
+    #                     specifically the failure mode where Rule 5 ("simpler first")
+    #                     loses its ordering after three wobbly iterations.
+    # Class escalation happens ONLY when step-back fires (step 9), via exhausted_classes.
+    move = pick_move(snapshot, gap, history, last_delta_sign, exhausted_classes)
     # Exactly one concrete action — edit a file, run a test, dispatch a sub-agent.
 
     # 4. EXECUTE
@@ -182,10 +190,18 @@ while True:
         delta = min(delta_structural, delta_userpath)   # zero if either is flat
         regression = False
 
-    # 7. COMMIT (so rollback is well-defined)
-    if regression:           git reset --hard HEAD; mark_regression()
-    elif delta > 0:          git commit -am "iter-N: <move summary>"
-    else:                    pass                  # no commit on zero-delta
+    # 7. COMMIT — every non-regression iteration, so audit trail matches status file 1:1
+    if regression:
+        git reset --hard HEAD; mark_regression()
+    elif delta > 0:
+        git commit -am "iter-N: <move summary>"
+    else:
+        # Zero-delta still commits, with a marker. Without this, the next
+        # positive iteration's commit silently bundles the zero-delta files,
+        # so a later `git reset --hard HEAD~1` would unwind two iterations
+        # at once. One extra (possibly empty) commit per zero-delta iteration
+        # is cheap; postmortem confusion later is not.
+        git commit -a --allow-empty -m "iter-N: zero-delta — <move summary>"
 
     last_delta_sign = sign(delta)
     delta_window.append(delta); delta_window = delta_window[-5:]
@@ -194,16 +210,26 @@ while True:
     overwrite_current_state_block(snapshot, gap, next_action)
     append_iteration_entry(iteration_number, elapsed, tokens_used, move, delta)
 
-    # 9. STEP BACK — smoothed, catches oscillation as well as flatline
-    zero_streak = count_trailing(delta_window, lambda d: d == 0)
-    net_window  = sum(delta_window)
-    oscillating = (len(delta_window) == 5
-                   and abs(net_window) <= NOISE_THRESHOLD
-                   and any(d > 0 for d in delta_window)
-                   and any(d < 0 for d in delta_window))
-    if zero_streak >= 3 or oscillating:
-        trigger_step_back()                  # force a different attack vector
-        delta_window = []                    # reset so we don't re-fire next iter
+    # 9. STEP BACK — three failure modes, one trigger
+    zero_streak     = count_trailing(delta_window, lambda d: d == 0)
+    net_window      = sum(delta_window)
+    oscillating     = (len(delta_window) == 5
+                       and abs(net_window) <= NOISE_THRESHOLD
+                       and any(d > 0 for d in delta_window)
+                       and any(d < 0 for d in delta_window))
+    slow_bleed      = (len(delta_window) >= 3
+                       and all(d < 0 for d in delta_window[-3:]))
+                       # a -1, -1, -1, -1 sequence has no zeros and is not
+                       # oscillating; without this branch it slips past
+                       # step-back and the loop bleeds.
+    if zero_streak >= 3 or oscillating or slow_bleed:
+        consult_expert_lens_panel()
+        exhausted_classes.add(current_cost_class)   # NOW the class is done — pick_move
+                                                    # will escalate to the next class.
+        new_attack = pick_different_vector(exhausted_classes)
+        if not new_attack:
+            escalate_as_hard_blocker(); break
+        delta_window = []                            # reset so we don't re-fire next iter
 ```
 
 **Definitions (the named functions above):**
