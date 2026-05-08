@@ -1,6 +1,6 @@
 ---
 name: autonomous-prototype-build
-description: Use when the user has a binary acceptance contract and wants the agent to keep working — measure, decide, execute, verify — until the contract passes, a hard architectural blocker forces a decision only they can make, or the wall-clock + token budget runs out. The skill writes status to a file the user can tail anytime; it does NOT ask for mid-loop confirmations. Triggers — EN: "autonomous build", "headless engineer", "ship until it works", "until it's done", "no breaks until working", "non-stop until done". DE: "fertig bis es geht", "ohne Unterbrechung", "headless modus".
+description: 'Use when the user has a binary acceptance contract and wants the agent to keep working — measure, decide, execute, verify — until the contract passes, a hard architectural blocker forces a decision only they can make, or the wall-clock + token budget runs out. The skill writes status to a file the user can tail anytime; it does NOT ask for mid-loop confirmations. Triggers — EN: "autonomous build", "headless engineer", "ship until it works", "until it''s done", "no breaks until working", "non-stop until done". DE: "fertig bis es geht", "ohne Unterbrechung", "headless modus".'
 license: MIT
 version: 0.2.0
 maintainer: michael@kupermann.com
