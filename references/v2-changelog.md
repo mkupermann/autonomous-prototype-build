@@ -91,3 +91,30 @@ Re-run this query periodically; new high-confidence findings should drive a V3 h
 **Symptom:** Pre-flight wrote `.claude/autonomous-build.lock` BEFORE running `git status --porcelain`. If the lock path wasn't already gitignored, the freshly-written lock dirtied the workspace and pre-flight failed on its own footprint.
 **Fix:** Re-ordered pre-flight in SKILL.md so workspace-clean check runs before any side effect (lock write, run-id computation, etc.). Added inline note that `.claude/` is conventionally gitignored; if not, the user must add the lock path explicitly.
 **Provenance:** F-NEW1 (self-discovered during V2 acceptance test). Not yet a `claude_memory` chunk; will be ingested on next session.
+
+## V2.1 — runnable scripts + operator quickref (2026-05-11)
+
+V2 documented the gates; V2.1 ships the gates.
+
+### What's new
+
+| Change | Closes |
+|--------|--------|
+| `scripts/neg-control.sh` — three reversible mutation strategies (revert HEAD, flip an assertion, corrupt a fixture) with auto-fallback. SKILL.md no longer carries a `<your strategy>` placeholder. | F7 (now runnable, not aspirational) |
+| `scripts/preflight.sh` — operator-facing pre-flight gate. Reads inputs from env vars, runs every V2 gate in order, emits the RUN_ID and writes the status-file header on success. | F4, F5, F6, F7, F10, F11, F12 |
+| `scripts/compute-run-id.sh` — stable `printf`-piped SHA256 helper shared by pre-flight and resume. Works on Linux (`sha256sum`) and macOS (`shasum`). | F5, F6 |
+| `OPERATOR_QUICKREF.md` — 30-line cheatsheet at repo root. Linked from the top of SKILL.md as the entry point for newcomers. | Reader-experience gap noted in v2.0.0 review feedback |
+| Pre-flight codifies a weak-contract refusal: if `CONTRACT` doesn't match a runnable shape (`pytest`, `npm`, `playwright`, `make`, etc., or `exits 0`), the gate refuses with a pointer to `writing-plans`. | Anti-pattern formerly stated in prose only |
+| SKILL.md anti-patterns list updated to reference the new scripts so future maintainers don't reinvent them. | Drift prevention |
+
+### Behavioral changes
+
+- Pre-flight `[F7]` check is now executed by a real script, not pseudocode. The script restores the workspace on every exit path; cleanup failure is reported loudly (exit 2) instead of leaving silent mutations.
+- Pre-flight refuses to start when `CONTRACT` looks like a goal description rather than a runnable command (e.g., "ship the feature" → rejected; "uv run pytest tests/foo.py exits 0" → accepted).
+- `scripts/preflight.sh` skips the subagent write-probe with a loud `[warn]` when `SUBAGENT_PROBE_CMD` is unset — operators are pointed at the override knob instead of silently passing the gate.
+- The MCP availability gate gracefully degrades when `claude` is not on PATH (pre-flight is runnable outside a Claude Code session) with a clear warning rather than a hard failure.
+
+### Non-changes (deliberately)
+
+- No new V2 gates added. V2.1 is purely an implementation pass on V2.0.
+- The loop body is unchanged. Subagent dispatch, trust-but-verify, monotonic iteration logging, verifier-amendment protocol — all identical to V2.0.

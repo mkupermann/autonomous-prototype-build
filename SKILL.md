@@ -1,17 +1,19 @@
 ---
 name: autonomous-prototype-build
-description: 'Use when the user has a binary acceptance contract and wants the agent to keep working — measure, decide, execute, verify — until the contract passes, a hard architectural blocker forces a decision only they can make, or the wall-clock + token budget runs out. Suited for prototype/POC delivery work that grinds: a failing test suite to drive green, a flaky integration to chase down, a small endpoint to ship. The skill writes status to a file the user can tail anytime; it does NOT ask for mid-loop confirmations. V2 hardens against the failure modes observed in past runs and recorded in the claude_memory database (verifier-command bugs, subagent miscounts, silent-pass tests, stream-timeout resume, MCP/permission gaps, helper-script path drift). Triggers — EN: "run until green", "agentic build until done", "fire and forget", "ship until it works", "no breaks until working", "non-stop until done", "build the prototype until it works". DE: "lauf alleine durch", "ohne Pause durchziehen", "bau das durch", "ohne Rückfrage", "headless durchlaufen lassen", "prototyp ohne Unterbrechung". Do NOT use for: taste-based goals ("make this nicer"), exploratory questions, single-test debugging that takes under 10 minutes total, or anything involving irreversible production actions (deploys, destructive DB ops, sending client email).'
+description: 'Use when the user has a binary acceptance contract and wants the agent to keep working — measure, decide, execute, verify — until the contract passes, a hard architectural blocker forces a decision only they can make, or the wall-clock + token budget runs out. Suited for prototype/POC delivery work that grinds: a failing test suite to drive green, a flaky integration to chase down, a small endpoint to ship. The skill writes status to a file the user can tail anytime; it does NOT ask for mid-loop confirmations. V2 hardens against the failure modes observed in past runs and recorded in the claude_memory database (verifier-command bugs, subagent miscounts, silent-pass tests, stream-timeout resume, MCP/permission gaps, helper-script path drift). V2.1 ships runnable scripts (preflight.sh, neg-control.sh, compute-run-id.sh) so [F7] is no longer a placeholder, plus an OPERATOR_QUICKREF.md and a codified weak-contract refusal in pre-flight. Triggers — EN: "run until green", "agentic build until done", "fire and forget", "ship until it works", "no breaks until working", "non-stop until done", "build the prototype until it works". DE: "lauf alleine durch", "ohne Pause durchziehen", "bau das durch", "ohne Rückfrage", "headless durchlaufen lassen", "prototyp ohne Unterbrechung". Do NOT use for: taste-based goals ("make this nicer"), exploratory questions, single-test debugging that takes under 10 minutes total, or anything involving irreversible production actions (deploys, destructive DB ops, sending client email).'
 license: MIT
-version: 2.0.0
+version: 2.1.0
 maintainer: michael@kupermann.com
-supersedes: autonomous-prototype-build@0.2.2
+supersedes: autonomous-prototype-build@2.0.0
 ---
 
 # Autonomous Prototype Build
 
 You give the agent: a command that exits 0 when the work is done, a wall-clock budget, a token budget, and a status file path. The agent gives you back: a green build, or a diagnostic. No "want me to continue?" interruptions.
 
-This is the V2 hardening of the original skill. Every guardrail added in V2 is provenance-tagged with the database finding that motivated it (`[F#]` markers); the changelog is in `references/v2-changelog.md`. The pre-V2 version is preserved at `archive/SKILL.v0.2.2.md` for reference.
+> **New here? Read `OPERATOR_QUICKREF.md` first** — 30-line version of this document, plus the runnable pre-flight invocation. Come back to this file when something in the quickref isn't enough.
+
+This is the V2 hardening of the original skill. Every guardrail added in V2 is provenance-tagged with the database finding that motivated it (`[F#]` markers); the changelog is in `references/v2-changelog.md`. The pre-V2 version is preserved at `archive/SKILL.v0.2.2.md` for reference. V2.1 (this version) replaces the pre-flight placeholders with runnable scripts under `scripts/`.
 
 This skill is for **delivery**, not exploration. Use brainstorming + writing-plans first to scope the work; then this skill to execute.
 
@@ -163,16 +165,14 @@ done
 
 # ─── Negative-control: verifier MUST fail on a broken state (V2 [F7]) ──
 # A test suite that can never fail is worthless as a contract.
-# Make a deliberately-broken state, verify the verifier rejects it, then restore.
-git stash push -m "neg-control" >/dev/null 2>&1 || true
-echo 'def __neg_control(): raise SystemExit(1)' > /tmp/neg_control_marker.py
-# Inject one obviously-broken assertion into the verifier path:
-NEG_CONTROL_FILE=$(<your strategy: revert HEAD~1, mutate one assertion, etc.>)
-if timeout "$PER_RUN_TIMEOUT" bash -c "$VERIFYING_COMMAND"; then
-    echo "VERIFIER PASSED A BROKEN STATE — refuse to start; contract is silent-pass"
-    git stash pop >/dev/null 2>&1; exit 1
-fi
-git stash pop >/dev/null 2>&1
+# V2.1: ship a runnable strategy library instead of pseudocode.
+# scripts/neg-control.sh tries three reversible mutations (revert last
+# commit, flip an assertion in tests/, corrupt a fixture) and asserts the
+# verifier exits non-zero on the broken state. Exit 0 = good. Exit 1 =
+# silent-pass contract; refuse to start.
+bash "$SKILL_DIR/scripts/neg-control.sh" "$VERIFYING_COMMAND" \
+    --strategy "${NEG_CONTROL_STRATEGY:-auto}" \
+    --timeout "$PER_RUN_TIMEOUT"
 
 # ─── Subagent write-probe (V2 [F4]) ──────────────────────────────────
 # Dispatch a sentinel subagent that writes a 1-byte file. Confirms permission stack.
@@ -468,6 +468,10 @@ V2 adds explicit machinery (negative control, verifier-amendment protocol, run-i
 
 ## See also
 
+- `OPERATOR_QUICKREF.md` — 30-line cheatsheet for fast invocation.
+- `scripts/preflight.sh` — runnable pre-flight (V2.1) covering every gate below.
+- `scripts/neg-control.sh` — silent-pass guard with three reversible mutation strategies.
+- `scripts/compute-run-id.sh` — the resume hash.
 - `references/v2-changelog.md` — full provenance of V2 changes against `claude_memory` findings.
 - `references/loop-pseudocode.md` — annotated loop pseudocode (carried from V0.2.2).
 - `references/decision-discipline.md` — full rule set (carried from V0.2.2).
